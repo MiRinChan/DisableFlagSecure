@@ -229,18 +229,71 @@ public class DisableFlagSecure extends XposedModule {
     }
 
     private static Field captureSecureLayersField;
+    private static boolean isSecureContentPolicy = false; // 标记：true=新版策略(int), false=旧版开关(boolean)
 
     private void hookScreenCapture(ClassLoader classLoader) throws ClassNotFoundException, NoSuchFieldException {
-        var screenCaptureClazz = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ?
-                classLoader.loadClass("android.window.ScreenCapture") :
-                SurfaceControl.class;
-        var captureArgsClazz = classLoader.loadClass(Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ?
-                "android.window.ScreenCapture$CaptureArgs" :
-                "android.view.SurfaceControl$CaptureArgs");
-        captureSecureLayersField = captureArgsClazz.getDeclaredField("mCaptureSecureLayers");
+        Class<?> screenCaptureClazz;
+        Class<?> captureArgsClazz;
+
+        // 1. 定位类 (处理 Internal 变化)
+        try {
+            // Android 36+ (Baklava) 优先尝试 Internal
+            captureArgsClazz = classLoader.loadClass("android.window.ScreenCaptureInternal$CaptureArgs");
+            screenCaptureClazz = classLoader.loadClass("android.window.ScreenCaptureInternal");
+        } catch (ClassNotFoundException e) {
+            // 回退到旧版本路径
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                captureArgsClazz = classLoader.loadClass("android.window.ScreenCapture$CaptureArgs");
+                screenCaptureClazz = classLoader.loadClass("android.window.ScreenCapture");
+            } else {
+                captureArgsClazz = classLoader.loadClass("android.view.SurfaceControl$CaptureArgs");
+                screenCaptureClazz = SurfaceControl.class;
+            }
+        }
+
+        // 2. 定位字段 (处理 mCaptureSecureLayers -> mSecureContentPolicy 变化)
+        try {
+            // 先试旧名字 (boolean)
+            captureSecureLayersField = captureArgsClazz.getDeclaredField("mCaptureSecureLayers");
+            isSecureContentPolicy = false;
+        } catch (NoSuchFieldException e) {
+            // 如果没找到，试新名字 (int)
+            // 这里不捕获异常，如果两个都没有，抛出异常让日志记录由外层处理是合理的
+            captureSecureLayersField = captureArgsClazz.getDeclaredField("mSecureContentPolicy");
+            isSecureContentPolicy = true;
+        }
+
         captureSecureLayersField.setAccessible(true);
+
+        // 3. Hook 方法
         hookMethods(screenCaptureClazz, ScreenCaptureHooker.class, "nativeCaptureDisplay");
         hookMethods(screenCaptureClazz, ScreenCaptureHooker.class, "nativeCaptureLayers");
+    }
+
+    // =======================================================
+    // 新增 Hooker 类：处理新的 ScreenCaptureParams
+    // =======================================================
+    @XposedHooker
+    private static class ScreenCaptureParamsHooker implements Hooker {
+        @BeforeInvocation
+        public static void before(@NonNull BeforeHookCallback callback) {
+            // 这是 android.window.ScreenCapture$ScreenCaptureParams$Builder 的实例
+            Object builder = callback.getThisObject();
+
+            try {
+                // 反射获取 mSecureContentPolicy 字段
+                // 对应新代码中的: private int mSecureContentPolicy = SECURE_CONTENT_POLICY_REDACT;
+                Field policyField = builder.getClass().getDeclaredField("mSecureContentPolicy");
+                policyField.setAccessible(true);
+
+                // 设置为 SECURE_CONTENT_POLICY_CAPTURE (值为 1)
+                policyField.setInt(builder, 1);
+
+            } catch (Throwable t) {
+                // 如果字段反射失败，也可以尝试直接调用 setter (如果有被混淆风险，反射字段更稳)
+                // module.log("Failed to override SecureContentPolicy", t);
+            }
+        }
     }
 
     private void hookDisplayControl(ClassLoader classLoader) throws ClassNotFoundException, NoSuchMethodException {
@@ -372,8 +425,17 @@ public class DisableFlagSecure extends XposedModule {
         @BeforeInvocation
         public static void before(@NonNull BeforeHookCallback callback) {
             var captureArgs = callback.getArgs()[0];
+            // 防止初始化失败导致的空指针
+            if (captureSecureLayersField == null) return;
+
             try {
-                captureSecureLayersField.set(captureArgs, true);
+                if (isSecureContentPolicy) {
+                    // Android 36+: 设置 SECURE_CONTENT_POLICY_CAPTURE = 1
+                    captureSecureLayersField.setInt(captureArgs, 1);
+                } else {
+                    // 旧版本: 设置 boolean = true
+                    captureSecureLayersField.setBoolean(captureArgs, true);
+                }
             } catch (IllegalAccessException t) {
                 module.log("ScreenCaptureHooker failed", t);
             }
