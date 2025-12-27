@@ -270,31 +270,6 @@ public class DisableFlagSecure extends XposedModule {
         hookMethods(screenCaptureClazz, ScreenCaptureHooker.class, "nativeCaptureLayers");
     }
 
-    // =======================================================
-    // 新增 Hooker 类：处理新的 ScreenCaptureParams
-    // =======================================================
-    @XposedHooker
-    private static class ScreenCaptureParamsHooker implements Hooker {
-        @BeforeInvocation
-        public static void before(@NonNull BeforeHookCallback callback) {
-            // 这是 android.window.ScreenCapture$ScreenCaptureParams$Builder 的实例
-            Object builder = callback.getThisObject();
-
-            try {
-                // 反射获取 mSecureContentPolicy 字段
-                // 对应新代码中的: private int mSecureContentPolicy = SECURE_CONTENT_POLICY_REDACT;
-                Field policyField = builder.getClass().getDeclaredField("mSecureContentPolicy");
-                policyField.setAccessible(true);
-
-                // 设置为 SECURE_CONTENT_POLICY_CAPTURE (值为 1)
-                policyField.setInt(builder, 1);
-
-            } catch (Throwable t) {
-                // 如果字段反射失败，也可以尝试直接调用 setter (如果有被混淆风险，反射字段更稳)
-                // module.log("Failed to override SecureContentPolicy", t);
-            }
-        }
-    }
 
     private void hookDisplayControl(ClassLoader classLoader) throws ClassNotFoundException, NoSuchMethodException {
         var displayControlClazz = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ?
